@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+/data/GRID/
+/data/student_grid/roi/
+/output/
+/benchmarks/GRID/models/GRID_V_WER4.8/model.pth

@@ -1,0 +1,4 @@
+# Student training does not need MediaPipe, TorchVision, TorchAudio or ESPnet.
+# Select the PyTorch CPU/CUDA wheel separately, as described in README.md.
+numpy==2.4.4
+torch==2.9.1

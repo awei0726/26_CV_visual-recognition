@@ -1,0 +1,10 @@
+# Install the legacy MediaPipe pipeline in a separate NumPy 1.x environment.
+onnxruntime==1.24.4
+numpy==1.26.4
+torch==2.9.1
+torchvision==0.24.1
+av==17.1.0
+mediapipe==0.10.14
+opencv-contrib-python==4.11.0.86
+scikit-image==0.25.2
+scipy==1.15.3

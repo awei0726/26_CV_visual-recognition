@@ -53,6 +53,8 @@ python train_student.py --mode kd --epochs 60 --batch-size 8 --seed 42 --tempera
 
 每轮自动验证，并记录损失、WER、CER 到 `history.csv`。`best.pt` 依次按验证 WER、CER 和 CTC 损失选择，`last.pt` 用于续训。续训时沿用该组的原命令，追加 `--resume <该组输出目录>/last.pt`，`--epochs` 表示目标总轮数。
 
+换电脑续训时复制完整的训练目录，并准备同一版清单、ROI 和 Teacher 缓存。清单内容相同时，Windows 和 WSL 的 CRLF/LF 换行差异可自动兼容。
+
 ### 复核验证结果
 
 评估时保留各组输出目录中的 `best.pt`、`config.json`、`history.csv`、`summary.json` 和 `status.json`。为每条评估命令使用新的输出目录。
@@ -62,7 +64,80 @@ python evaluate_student.py --checkpoint output/student_midterm/ctc/best.pt --man
 python evaluate_student.py --checkpoint output/student_midterm/kd/best.pt --manifest data/student_grid/val.jsonl --output-dir output/student_midterm/eval_kd
 ```
 
-`metrics.json` 中的 WER 和 CER 为比率，`predictions.jsonl` 保存逐样本结果。报告时说明结果基于当前 Student 划分和给定 Teacher。按样本 ID 对照，仓库的 Teacher 训练参考清单覆盖本次 Student 验证集的 2,000 条样本。
+`metrics.json` 中的 WER 和 CER 为比率，`predictions.jsonl` 保存逐样本结果。找到与 checkpoint 指纹匹配的训练清单后，评估会记录与该清单重叠的样本数，存在重叠时结果仅作诊断。报告结果时说明实验基于当前 Student 划分和给定 Teacher。仓库所附的 Teacher 训练参考清单包含 Student 验证集全部 2,000 条样本和测试集全部 4,000 条样本。
+
+## 后续蒸馏实验
+
+在相同的 Student 模型、数据划分、随机种子和训练预算下比较四组。各组从同一初始化规则开始，独立保存 checkpoint。
+
+| 组别 | 模式 | 训练目标 |
+| --- | --- | --- |
+| E1 | `ctc` | CTC 监督 |
+| E2 | `kd` | CTC 加均匀的有效帧蒸馏 |
+| E3 | `kd-entropy` | CTC 加按 Teacher 预测熵调整权重的蒸馏 |
+| E4 | `kd-blank` | CTC 加同时考虑预测熵和 Blank 概率的蒸馏 |
+
+两种自适应模式根据未加温的 Teacher 概率计算帧权重，`--kd-epsilon` 默认 0.1。只对有效帧归一化，使平均权重为 1。蒸馏项仍使用相同温度和温度平方缩放。
+
+自适应 KD 会检查完整的 Teacher 词表顺序，支持仓库的词表或内容相同的副本。比较 E2–E4 时，核对独立评估记录里的 `training_data_fingerprint`，它包含训练 ROI 和 Teacher 缓存内容。与纯 CTC 对照时，核对 `training_roi_fingerprint`。
+
+```sh
+python train_student.py --mode kd-entropy --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/entropy
+python train_student.py --mode kd-blank --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/blank
+```
+
+后期训练命令可加 `--preflight-only`，逐个读取所选训练 ROI、KD 所用的 Teacher 缓存和验证 ROI，并报告样本数与数据指纹。该检查不创建训练输出。训练入口会拒绝将保留测试样本用作自适应 KD 的训练或验证数据。
+
+同一对照计划已有基线 `config.json` 时，可传入 `--reference-config 路径` 核对模型、词表、数据、随机种子和训练预算。KD 组之间还会核对 Teacher 缓存和共有蒸馏参数。该选项可以重复传入，也可以随 `--preflight-only` 单独检查。比较结果时，根据各组的 `status.json` 和 `summary.json` 确认实际完成的训练预算。
+
+数据规模消融给两条对照命令同时加 `--train-size 1000 --subset-seed 42`，或同时改用 4,000 条。采样基于样本 ID 和相同的子集种子，小子集包含在大子集里。现有全量训练清单有 7,887 条，跑全量时省略 `--train-size`。每种规模使用独立输出目录。`--limit-train` 和 `--limit-val` 用于流程试跑。
+
+## ONNX、INT8 与 CPU 对照
+
+在 Student 环境内安装部署依赖。导出脚本接受已有 Student checkpoint，运行时只需要 Student 模型。默认使用训练清单中固定种子选出的 128 个样本做静态 QDQ 校准。
+
+```sh
+python -m pip install -r requirements-deployment.txt
+python export_student.py --checkpoint output/student_final/blank/best.pt --output-dir output/student_final/blank_onnx
+```
+
+导出目录包含 `student_fp32.onnx`、`student_int8.onnx` 和 `export_report.json`。报告记录 checkpoint、校准样本、量化节点和导出自检。给 `export_student.py` 加 `--fp32-only` 可单独导出 FP32。
+
+用同一份评估清单比较两种精度。验证集用于调试和选择配置，定稿后用测试清单做最终比较。
+
+CPU 对照和预裁剪 ROI 推理只需要 NumPy、ONNX Runtime 和测量依赖，可在单独的 Python 3.11 环境中安装 `requirements-runtime.txt`。
+
+```sh
+python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.onnx --int8 output/student_final/blank_onnx/student_int8.onnx --manifest data/student_grid/val.jsonl --output-dir output/student_final/blank_benchmark --threads 1
+```
+
+`metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。峰值常驻内存来自各自的 NumPy/ONNX Runtime 独立进程，并记录加载模型前的基线。比较时使用同一台机器、同一版本、相同线程数和清单。
+
+CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分。若模型曾在同一完整测试集上做验证，PyTorch 评估和 ONNX 基准都会拒绝将其用于测试。自定义清单和受限样本试跑的结果标为诊断。
+
+正式的 CPU 对照还会核验 ONNX 记录的 checkpoint 训练清单指纹。旧导出和自定义训练仍支持 CPU 试跑，会标为诊断。旧 ONNX 如需用于正式对照，使用对应 checkpoint 重新导出一对模型。
+
+最终测试时从仓库根目录取得测试包，再把评估命令的 `--manifest` 指向 `data/student_grid/test.jsonl`，使用新的输出目录。
+
+```sh
+git lfs pull --include="training-data/grid-test.tar.gz" --exclude=""
+tar -xzf training-data/grid-test.tar.gz
+```
+
+## 单视频演示
+
+准备好的灰度 ROI 可以直接输入 ONNX Student。
+
+```sh
+python predict_student.py --model output/student_final/blank_onnx/student_int8.onnx --roi data/student_grid/roi/s9/bbae4n.npy
+```
+
+处理原始视频时，在独立的 Python 3.11 环境安装 `requirements-video.txt`。演示沿用项目的 MediaPipe 人脸对齐和灰度口型裁剪，适用于单人、正脸、接近 GRID 采集条件的短片。
+
+```sh
+python -m pip install -r requirements-video.txt
+python predict_student.py --model output/student_final/blank_onnx/student_int8.onnx --video path/to/clip.mpg
+```
 
 ## 重新生成输入
 

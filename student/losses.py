@@ -1,4 +1,4 @@
-"""CTC supervision and valid-frame standard knowledge distillation."""
+"""CTC supervision and valid-frame standard and adaptive distillation."""
 
 from __future__ import annotations
 
@@ -70,17 +70,12 @@ def ctc_loss(
     return loss.to(student_logits.device)
 
 
-def standard_kd_loss(
+def _distillation_logits(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     input_lengths: torch.Tensor,
-    temperature: float = 2.0,
-) -> torch.Tensor:
-    """tau² * mean_valid_frame KL(teacher_tau || student_tau).
-
-    Teacher logits are detached. Padding is selected out before softmax, so
-    padded values never affect the loss or its gradients.
-    """
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate_lengths(student_logits, input_lengths)
     if teacher_logits.shape != student_logits.shape or not teacher_logits.is_floating_point():
         raise ValueError("Teacher logits must be floating point and match student [B,T,V]")
@@ -89,12 +84,60 @@ def standard_kd_loss(
     positions = torch.arange(student_logits.shape[1], device=student_logits.device)
     mask = positions.unsqueeze(0) < input_lengths.to(student_logits.device).unsqueeze(1)
     student = student_logits.float()[mask] / temperature
-    teacher = teacher_logits.detach().to(device=student_logits.device, dtype=torch.float32)[mask] / temperature
-    if not torch.isfinite(student).all() or not torch.isfinite(teacher).all():
+    teacher = teacher_logits.detach().to(device=student_logits.device, dtype=torch.float32)[mask]
+    teacher_tempered = teacher / temperature
+    if not torch.isfinite(student).all() or not torch.isfinite(teacher_tempered).all():
         raise ValueError("Valid distillation logits contain NaN or Inf")
+    return student, teacher_tempered, teacher
+
+
+def standard_kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    input_lengths: torch.Tensor,
+    temperature: float = 2.0,
+) -> torch.Tensor:
+    """tau² * mean_valid_frame KL(teacher_tau || student_tau)."""
+    student, teacher, _ = _distillation_logits(student_logits, teacher_logits, input_lengths, temperature)
     loss = F.kl_div(
         F.log_softmax(student, dim=-1),
         F.softmax(teacher, dim=-1),
         reduction="batchmean",
     )
     return loss * (temperature * temperature)
+
+
+def adaptive_kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    input_lengths: torch.Tensor,
+    temperature: float = 2.0,
+    *,
+    epsilon: float = 0.1,
+    blank_id: int | None = None,
+) -> torch.Tensor:
+    """Weight tempered KL by teacher confidence and optionally nonblank probability.
+
+    Compute weights from the ordinary teacher distribution. Normalize them to
+    mean one over the valid frames of the batch so the KD scale stays comparable.
+    """
+    if not math.isfinite(epsilon) or not 0 < epsilon <= 1:
+        raise ValueError("epsilon must be finite and in (0, 1]")
+    student, teacher_tempered, teacher = _distillation_logits(
+        student_logits, teacher_logits, input_lengths, temperature
+    )
+    vocab_size = teacher.shape[-1]
+    if blank_id is not None and (type(blank_id) is not int or not 0 <= blank_id < vocab_size):
+        raise ValueError("blank_id outside vocabulary")
+    probabilities = teacher.softmax(dim=-1)
+    entropy = torch.special.entr(probabilities).sum(dim=-1)
+    confidence = (1 - entropy / math.log(vocab_size)).clamp(0, 1)
+    if blank_id is not None:
+        confidence = confidence * (1 - probabilities[:, blank_id])
+    # Keep even very small positive floors representable until normalization.
+    weights = epsilon + (1 - epsilon) * confidence.double()
+    frame_kl = F.kl_div(
+        student.log_softmax(dim=-1), teacher_tempered.softmax(dim=-1), reduction="none"
+    ).sum(dim=-1)
+    weights = (weights / weights.sum()).to(frame_kl.dtype)
+    return (weights * frame_kl).sum() * (temperature * temperature)

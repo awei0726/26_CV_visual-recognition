@@ -32,10 +32,13 @@ from student.checkpoint import atomic_json, atomic_save, atomic_text, model_stat
 from student.evaluation import evaluate
 from student.losses import adaptive_kd_loss, ctc_loss, standard_kd_loss
 from student.model import StudentModel
+from student.splits import manifest_digests
 
 ROOT = Path(__file__).resolve().parent
 # Exact implementation fingerprint of the compatible midterm release (ec3836d).
 MIDTERM_IMPLEMENTATION_SHA256 = "2f46c006fc6b99538ab299da576520929422a0fb44464059e2343396c018cc37"
+# Prior adaptive release used the same training math (aa50ac0 and 6545be1).
+PRE_PORTABLE_IMPLEMENTATION_SHA256 = "8cf5485372ea9dcc7b30cf68c55929544ccddabc64977b7e7a9b68d323716c3c"
 ADAPTIVE_MODES = ("kd-entropy", "kd-blank")
 FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
           "val_cer", "lr", "next_lr", "seconds", "peak_cuda_mib", "train_samples", "val_samples",
@@ -273,6 +276,8 @@ def run(args, root, output):
     model_config = model.get_config()
 
     train_path, val_path = resolve(args.train_manifest, root), resolve(args.val_manifest, root)
+    manifest_paths = {"train_manifest_sha256": train_path, "val_manifest_sha256": val_path}
+    manifest_bytes = {key: path.read_bytes() for key, path in manifest_paths.items()}
     train_set = GridDataset(train_path, root, vocabulary, load_teacher=args.mode != "ctc")
     val_set = GridDataset(val_path, root, vocabulary, load_teacher=False)
     train_ids = {record["id"] for record in train_set.records}
@@ -293,6 +298,9 @@ def run(args, root, output):
     train_roi_fingerprint = (train_fingerprint if args.mode == "ctc"
                              else train_set.fingerprint(include_teacher=False, indices=train_indices))
     val_fingerprint = val_set.fingerprint()
+    for key, path in manifest_paths.items():
+        if path.read_bytes() != manifest_bytes[key]:
+            raise ValueError(f"Manifest changed while checking training data: {path}")
     if train_indices is not None:
         train_set = Subset(train_set, train_indices)
     elif args.limit_train is not None:
@@ -321,10 +329,9 @@ def run(args, root, output):
                         cudnn=torch.backends.cudnn.version() if device.type == "cuda" else None,
                         platform=platform.platform())
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    config.update({key: hashlib.sha256(data).hexdigest() for key, data in manifest_bytes.items()})
     config.update(root=str(root), output_dir=str(output), device=str(device),
                   model_config=model_config, vocab_tokens=vocabulary.tokens,
-                  train_manifest_sha256=hashlib.sha256(train_path.read_bytes()).hexdigest(),
-                  val_manifest_sha256=hashlib.sha256(val_path.read_bytes()).hexdigest(),
                   train_samples=len(train_set), val_samples=len(val_set),
                   parameters=model.count_parameters(), torch_version=str(torch.__version__),
                   numpy_version=str(np.__version__), decoder="ctc_greedy", metric_unit="ratio",
@@ -350,13 +357,16 @@ def run(args, root, output):
         immutable = ["mode", "batch_size", "lr", "weight_decay", "kd_weight", "temperature", "kd_epsilon",
                      "grad_clip", "lr_patience", "lr_monitor", "seed", "amp", "amp_init_scale", "deterministic", "workers",
                      "limit_train", "limit_val", "train_size", "subset_seed", "model_config", "vocab_tokens",
-                     "train_manifest_sha256", "val_manifest_sha256", "train_data_fingerprint", "val_data_fingerprint",
+                     "train_data_fingerprint", "val_data_fingerprint",
                      "implementation_sha256", "preprocessing_version", "smoke_test", "train_roi_fingerprint"]
         previous_config = checkpoint["config"]
-        if (args.mode in ("ctc", "kd") and
-                previous_config.get("implementation_sha256") == MIDTERM_IMPLEMENTATION_SHA256):
+        previous_implementation = previous_config.get("implementation_sha256")
+        if (previous_implementation == PRE_PORTABLE_IMPLEMENTATION_SHA256
+                or (args.mode in ("ctc", "kd") and previous_implementation == MIDTERM_IMPLEMENTATION_SHA256)):
             immutable.remove("implementation_sha256")
         changed = [key for key in immutable if previous_config.get(key) != config.get(key)]
+        changed.extend(key for key, data in manifest_bytes.items()
+                       if previous_config.get(key) not in manifest_digests(data))
         if changed:
             raise ValueError(f"Resume options differ for {changed}; repeat original options")
         if model_state_sha256(checkpoint["model_state"]) != checkpoint["model_sha256"]:

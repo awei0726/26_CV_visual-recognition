@@ -53,6 +53,8 @@ python train_student.py --mode kd --epochs 60 --batch-size 8 --seed 42 --tempera
 
 每轮自动验证，并记录损失、WER、CER 到 `history.csv`。`best.pt` 依次按验证 WER、CER 和 CTC 损失选择，`last.pt` 用于续训。续训时沿用该组的原命令，追加 `--resume <该组输出目录>/last.pt`，`--epochs` 表示目标总轮数。
 
+换电脑续训时复制完整的训练目录，并准备同一版清单、ROI 和 Teacher 缓存。清单内容相同时，Windows 和 WSL 的 CRLF/LF 换行差异可自动兼容。
+
 ### 复核验证结果
 
 评估时保留各组输出目录中的 `best.pt`、`config.json`、`history.csv`、`summary.json` 和 `status.json`。为每条评估命令使用新的输出目录。
@@ -104,6 +106,8 @@ python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.
 `metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。每种精度在独立进程测峰值常驻内存，并记录加载模型前的基线。同一台机器、相同线程数和相同清单才适合直接比较。
 
 CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分，自定义清单和受限样本试跑的结果标为诊断。
+
+正式的 CPU 对照还会核验 ONNX 记录的 checkpoint 训练清单指纹。旧导出和自定义训练仍支持 CPU 试跑，会标为诊断。旧 ONNX 如需用于正式对照，使用对应 checkpoint 重新导出一对模型。
 
 最终测试时从仓库根目录取得测试包，再把评估命令的 `--manifest` 指向 `data/student_grid/test.jsonl`，使用新的输出目录。
 

@@ -61,6 +61,7 @@ def _load_student(path: Path):
         "path": str(path), "sha256": checkpoint_sha, "model_sha256": state_sha,
         "epoch": checkpoint.get("epoch"), "run_id": checkpoint.get("run_id"),
         "mode": training.get("mode"), "smoke_test": training.get("smoke_test"),
+        "train_manifest_sha256": training.get("train_manifest_sha256"),
     }
     return model.eval(), vocabulary, provenance
 
@@ -202,6 +203,8 @@ def export_student(checkpoint: Path, output_dir: Path, root: Path, *,
             "parameters": str(model.count_parameters()),
             "training_smoke_test": json.dumps(provenance["smoke_test"]),
         }
+        if isinstance(provenance["train_manifest_sha256"], str):
+            metadata["training_manifest_sha256"] = provenance["train_manifest_sha256"]
         report = {
             "schema_version": 1, "status": "complete", "checkpoint": provenance,
             "opset": ONNX_OPSET, "model_config": model.get_config(), "parameters": model.count_parameters(),

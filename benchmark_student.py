@@ -20,7 +20,7 @@ from student.checkpoint import atomic_json, atomic_text, run_lock
 from student.data import CharacterVocabulary, GridDataset, PREPROCESSING_VERSION
 from student.evaluation import edit_distance
 from student.onnx_runtime import OnnxStudent
-from student.splits import benchmark_split, GRID_TRAIN_MANIFEST
+from student.splits import benchmark_split, GRID_TRAIN_MANIFEST, manifest_digests
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -199,7 +199,7 @@ def pair_predictions(fp32: dict, int8: dict) -> list[dict]:
     )):
         raise ValueError("The two benchmarks did not evaluate the same GRID data.")
     for key in ("model_sha256", "checkpoint_sha256", "vocab_tokens", "preprocessing_version",
-                "model_config", "training_smoke_test", "parameters"):
+                "model_config", "training_smoke_test", "training_manifest_sha256", "parameters"):
         if fp32["model_metadata"].get(key) != int8["model_metadata"].get(key):
             raise ValueError(f"FP32 and INT8 artifacts disagree on {key}. Export them as one pair.")
     if [row["id"] for row in fp32["latency_measurements"]] != [
@@ -267,6 +267,12 @@ def main(argv=None) -> dict:
             if parameters < 1:
                 raise ValueError("Expected a positive parameter count in ONNX metadata.")
             evaluation_split = fp32["evaluation_split"]
+            training_reference = root / GRID_TRAIN_MANIFEST
+            checkpoint_training_sha = fp32["model_metadata"].get("training_manifest_sha256")
+            checkpoint_grid_training_verified = (
+                training_reference.is_file()
+                and checkpoint_training_sha in manifest_digests(training_reference.read_bytes())
+            )
             report = {
                 "schema_version": 1,
                 "evaluation_status": "complete",
@@ -275,8 +281,9 @@ def main(argv=None) -> dict:
                 "samples": fp32["samples"],
                 "evaluation_split": evaluation_split,
                 "smoke_test": (args.limit is not None or evaluation_split == "custom"
-                               or checkpoint_smoke_test is not False),
+                               or checkpoint_smoke_test is not False or not checkpoint_grid_training_verified),
                 "checkpoint_smoke_test": checkpoint_smoke_test,
+                "checkpoint_grid_training_verified": checkpoint_grid_training_verified,
                 "parameters": parameters,
                 "preprocessing_version": PREPROCESSING_VERSION,
                 "decoder": "ctc_greedy",

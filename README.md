@@ -62,7 +62,7 @@ python evaluate_student.py --checkpoint output/student_midterm/ctc/best.pt --man
 python evaluate_student.py --checkpoint output/student_midterm/kd/best.pt --manifest data/student_grid/val.jsonl --output-dir output/student_midterm/eval_kd
 ```
 
-`metrics.json` 中的 WER 和 CER 为比率，`predictions.jsonl` 保存逐样本结果。报告时说明结果基于当前 Student 划分和给定 Teacher。按样本 ID 对照，仓库的 Teacher 训练参考清单覆盖本次 Student 验证集的 2,000 条样本。
+`metrics.json` 中的 WER 和 CER 为比率，`predictions.jsonl` 保存逐样本结果。找到与 checkpoint 指纹匹配的训练清单后，评估会记录与该清单重叠的样本数，存在重叠时结果仅作诊断。报告结果时说明实验基于当前 Student 划分和给定 Teacher。仓库所附的 Teacher 训练参考清单包含 Student 验证集全部 2,000 条样本和测试集全部 4,000 条样本。
 
 ## 后续蒸馏实验
 
@@ -102,6 +102,8 @@ python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.
 ```
 
 `metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。每种精度在独立进程测峰值常驻内存，并记录加载模型前的基线。同一台机器、相同线程数和相同清单才适合直接比较。
+
+CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分，自定义清单和受限样本试跑的结果标为诊断。
 
 最终测试时从仓库根目录取得测试包，再把评估命令的 `--manifest` 指向 `data/student_grid/test.jsonl`，使用新的输出目录。
 

@@ -20,6 +20,7 @@ from student.checkpoint import atomic_json, atomic_text, run_lock
 from student.data import CharacterVocabulary, GridDataset, PREPROCESSING_VERSION
 from student.evaluation import edit_distance
 from student.onnx_runtime import OnnxStudent
+from student.splits import benchmark_split, GRID_TRAIN_MANIFEST
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -81,7 +82,10 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
 
     torch.set_num_threads(1)
     vocabulary = CharacterVocabulary.from_file(plan["vocabulary"])
-    dataset = GridDataset(plan["manifest"], plan["root"], vocabulary, load_teacher=False)
+    manifest_path = Path(plan["manifest"])
+    manifest_sha = sha256_file(manifest_path)
+    dataset = GridDataset(manifest_path, plan["root"], vocabulary, load_teacher=False)
+    evaluation_split = benchmark_split(dataset)
     sample_count = len(dataset) if plan["limit"] is None else plan["limit"]
     if sample_count > len(dataset):
         raise ValueError(f"Requested {sample_count} samples but the manifest has {len(dataset)}.")
@@ -133,6 +137,9 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
     peak, _ = peak_rss(process)
     if sha256_file(path) != model_hash:
         raise ValueError(f"ONNX model changed during benchmarking: {path}")
+    if (sha256_file(manifest_path) != manifest_sha
+            or dataset.fingerprint(include_teacher=False, indices=selected) != fingerprint):
+        raise ValueError("Evaluation manifest or ROI files changed during benchmarking.")
 
     counts = {key: sum(row[key] for row in results)
               for key in ("word_errors", "word_count", "char_errors", "char_count")}
@@ -145,7 +152,8 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
         "size_bytes": path.stat().st_size,
         "model_metadata": model.metadata,
         "dataset_fingerprint": fingerprint,
-        "manifest_sha256": sha256_file(Path(plan["manifest"])),
+        "manifest_sha256": manifest_sha,
+        "evaluation_split": evaluation_split,
         "samples": sample_count,
         **counts,
         "wer": counts["word_errors"] / counts["word_count"],
@@ -187,7 +195,7 @@ def run_workers(plan: dict, scratch: Path) -> tuple[dict, dict]:
 
 def pair_predictions(fp32: dict, int8: dict) -> list[dict]:
     if any(fp32[key] != int8[key] for key in (
-        "dataset_fingerprint", "manifest_sha256", "samples", "word_count", "char_count",
+        "dataset_fingerprint", "manifest_sha256", "evaluation_split", "samples", "word_count", "char_count",
     )):
         raise ValueError("The two benchmarks did not evaluate the same GRID data.")
     for key in ("model_sha256", "checkpoint_sha256", "vocab_tokens", "preprocessing_version",
@@ -230,12 +238,8 @@ def main(argv=None) -> dict:
         parser.error("--limit must be positive.")
     root = args.root.resolve()
     manifest = resolve(args.manifest, root)
-    if manifest == (root / "data/student_grid/train.jsonl").resolve():
+    if manifest == (root / GRID_TRAIN_MANIFEST).resolve():
         parser.error("Use a held-out validation or test manifest for the benchmark.")
-    split_names = {
-        (root / "data/student_grid/val.jsonl").resolve(): "val",
-        (root / "data/student_grid/test.jsonl").resolve(): "test",
-    }
     plan = {
         "root": str(root), "manifest": str(manifest), "vocabulary": str(resolve(args.vocab, root)),
         "fp32": str(resolve(args.fp32, root)), "int8": str(resolve(args.int8, root)),
@@ -262,14 +266,16 @@ def main(argv=None) -> dict:
             parameters = int(fp32["model_metadata"]["parameters"])
             if parameters < 1:
                 raise ValueError("Expected a positive parameter count in ONNX metadata.")
+            evaluation_split = fp32["evaluation_split"]
             report = {
                 "schema_version": 1,
                 "evaluation_status": "complete",
                 "manifest": str(manifest), "manifest_sha256": fp32["manifest_sha256"],
                 "dataset_fingerprint": fp32["dataset_fingerprint"],
                 "samples": fp32["samples"],
-                "evaluation_split": split_names.get(manifest, "custom"),
-                "smoke_test": args.limit is not None or checkpoint_smoke_test is True,
+                "evaluation_split": evaluation_split,
+                "smoke_test": (args.limit is not None or evaluation_split == "custom"
+                               or checkpoint_smoke_test is not False),
                 "checkpoint_smoke_test": checkpoint_smoke_test,
                 "parameters": parameters,
                 "preprocessing_version": PREPROCESSING_VERSION,

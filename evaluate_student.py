@@ -17,6 +17,7 @@ from student.data import (
 from student.evaluation import evaluate
 from student.checkpoint import atomic_json, model_state_sha256, run_lock
 from student.model import StudentModel
+from student.splits import manifest_digests, training_manifest_overlap
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -102,10 +103,7 @@ def main(argv=None):
         vocabulary = CharacterVocabulary.from_file(vocabulary_path)
         manifest_bytes = manifest_path.read_bytes()
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        # Git can check out the same JSONL using LF or CRLF on different machines.
-        lf_manifest = manifest_bytes.replace(b"\r\n", b"\n")
-        manifest_hashes = {manifest_sha256, hashlib.sha256(lf_manifest).hexdigest(),
-                           hashlib.sha256(lf_manifest.replace(b"\n", b"\r\n")).hexdigest()}
+        manifest_hashes = manifest_digests(manifest_bytes)
         # Hash and load the same open artifact. A concurrently replaced best.pt
         # must not produce a fingerprint for different model weights.
         with checkpoint_path.open("rb") as checkpoint_stream:
@@ -142,6 +140,7 @@ def main(argv=None):
             training_config.get("train_manifest_sha256") in manifest_hashes
             or evaluation_data_fingerprint == training_config.get("train_roi_fingerprint")
         )
+        training_overlap = training_manifest_overlap(dataset, training_config)
         if (matches_validation_manifest and trained_val_fingerprint is not None
                 and trained_val_fingerprint != evaluation_data_fingerprint):
             raise ValueError("Validation data differs from the ROI and labels recorded in the checkpoint. "
@@ -161,6 +160,9 @@ def main(argv=None):
             raise ValueError(f"Output directory must be new or empty: {output_dir}")
         output_initialized = True
         metrics = evaluate(model, loader, device, vocabulary, predictions_path=predictions_path)
+        if (sha256_file(manifest_path) != manifest_sha256
+                or dataset.fingerprint(False) != evaluation_data_fingerprint):
+            raise ValueError("Evaluation manifest or ROI files changed during evaluation.")
         checkpoint_is_best = completed_run_best(checkpoint_path, checkpoint, state_sha256)
         checkpoint_best_scope = None
         if checkpoint_is_best is not None:
@@ -181,6 +183,7 @@ def main(argv=None):
             "manifest": str(manifest_path), "manifest_sha256": manifest_sha256,
             "evaluation_data_fingerprint": evaluation_data_fingerprint,
             "matches_training_input": matches_training_input,
+            "training_manifest_overlap": training_overlap,
             "validation_data_verified": validation_data_verified,
             "predictions_sha256": sha256_file(predictions_path),
             "vocabulary_sha256": sha256_file(vocabulary_path),
@@ -198,6 +201,7 @@ def main(argv=None):
                 key: training_config.get(key) for key in (
                     "batch_size", "epochs", "lr", "weight_decay", "grad_clip", "lr_patience",
                     "lr_monitor", "amp", "amp_init_scale", "deterministic", "temperature", "kd_weight",
+                    "kd_epsilon", "train_size", "subset_seed",
                 )
             },
             "model_config": model.get_config(),
@@ -242,6 +246,8 @@ def main(argv=None):
 
     if metrics["matches_training_input"]:
         print("DIAGNOSTIC: the evaluation matches the training data. Use held-out data to measure generalization.")
+    elif metrics["training_manifest_overlap"]:
+        print("DIAGNOSTIC: the evaluation includes samples from the training pool.")
     if metrics["checkpoint_is_best"] is False:
         print("CHECKPOINT: the evaluated weights differ from the recorded best selection.")
     if metrics["smoke_test"] is True:

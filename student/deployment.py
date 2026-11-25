@@ -21,9 +21,10 @@ from student.data import (
     PREPROCESSING_VERSION,
 )
 from student.model import StudentModel
+from student.splits import GRID_TRAIN_MANIFEST
 
 
-TRAIN_MANIFEST = Path("data/student_grid/train.jsonl")
+TRAIN_MANIFEST = GRID_TRAIN_MANIFEST
 ONNX_OPSET = 17
 QUANTIZED_OPERATORS = ("Conv", "Gemm", "MatMul")
 CPU_PROVIDER = "CPUExecutionProvider"
@@ -68,6 +69,7 @@ def _calibration_dataset(root: Path, manifest: Path, vocabulary: CharacterVocabu
                          count: int, seed: int):
     manifest = (root / manifest).resolve()
     train = (root / TRAIN_MANIFEST).resolve()
+    manifest_sha = _sha256_file(manifest)
     dataset = GridDataset(manifest, root, vocabulary, load_teacher=False, validate=False)
     if manifest != train:
         canonical = GridDataset(train, root, vocabulary, load_teacher=False, validate=False)
@@ -81,7 +83,7 @@ def _calibration_dataset(root: Path, manifest: Path, vocabulary: CharacterVocabu
         raise ValueError(f"Requested {count} calibration samples, but {manifest} has {len(dataset)}")
     indices = random.Random(seed).sample(range(len(dataset)), count)
     provenance = {
-        "manifest": str(manifest), "manifest_sha256": _sha256_file(manifest),
+        "manifest": str(manifest), "manifest_sha256": manifest_sha,
         "seed": seed, "samples": count, "method": "MinMax", "format": "QDQ",
         "activation_dtype": "int8", "weight_dtype": "int8", "per_channel_weights": True,
         "sample_ids": [dataset.records[i]["id"] for i in indices],

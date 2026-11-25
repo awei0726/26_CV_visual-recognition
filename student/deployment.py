@@ -62,6 +62,7 @@ def _load_student(path: Path):
         "epoch": checkpoint.get("epoch"), "run_id": checkpoint.get("run_id"),
         "mode": training.get("mode"), "smoke_test": training.get("smoke_test"),
         "train_manifest_sha256": training.get("train_manifest_sha256"),
+        "val_manifest_sha256": training.get("val_manifest_sha256"),
         "train_data_fingerprint": training.get("train_data_fingerprint"),
         "val_data_fingerprint": training.get("val_data_fingerprint"),
     }
@@ -208,6 +209,7 @@ def export_student(checkpoint: Path, output_dir: Path, root: Path, *,
         for key, field in (
             ("training_mode", "mode"), ("training_run_id", "run_id"),
             ("training_manifest_sha256", "train_manifest_sha256"),
+            ("validation_manifest_sha256", "val_manifest_sha256"),
             ("training_data_fingerprint", "train_data_fingerprint"),
             ("validation_data_fingerprint", "val_data_fingerprint"),
         ):

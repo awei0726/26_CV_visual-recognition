@@ -52,6 +52,15 @@ def _samples(dataset: GridManifest) -> set[tuple]:
             for row in dataset.records}
 
 
+def is_held_out_split(dataset: GridManifest, split: str) -> bool:
+    expected_count, expected_speakers = GRID_HELD_OUT_SPLITS[split]
+    path = dataset.root / GRID_MANIFEST_DIR / f"{split}.jsonl"
+    if len(dataset) != expected_count or not path.is_file():
+        return False
+    speakers = {row["id"].split("/", 1)[0] for row in dataset.records}
+    return speakers == expected_speakers and _samples(dataset) == _samples(_reference(dataset, path))
+
+
 def benchmark_split(dataset: GridManifest) -> str:
     """Identify a complete GRID held-out split and reject training-pool leakage."""
     train = dataset.root / GRID_TRAIN_MANIFEST
@@ -61,11 +70,4 @@ def benchmark_split(dataset: GridManifest) -> str:
     if overlap:
         raise ValueError(f"Benchmark manifest overlaps the GRID training split: {overlap} sample(s).")
 
-    speakers = {row["id"].split("/", 1)[0] for row in dataset.records}
-    for split, (expected_count, expected_speakers) in GRID_HELD_OUT_SPLITS.items():
-        path = dataset.root / GRID_MANIFEST_DIR / f"{split}.jsonl"
-        if len(dataset) == expected_count and speakers == expected_speakers and path.is_file():
-            reference = _reference(dataset, path)
-            if _samples(dataset) == _samples(reference):
-                return split
-    return "custom"
+    return next((split for split in GRID_HELD_OUT_SPLITS if is_held_out_split(dataset, split)), "custom")

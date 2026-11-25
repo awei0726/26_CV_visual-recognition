@@ -86,6 +86,10 @@ python train_student.py --mode kd-entropy --epochs 60 --batch-size 8 --seed 42 -
 python train_student.py --mode kd-blank --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/blank
 ```
 
+后期训练命令可加 `--preflight-only`，逐个读取所选训练 ROI、KD 所用的 Teacher 缓存和验证 ROI，并报告样本数与数据指纹。该检查不创建训练输出。训练入口会拒绝将保留测试样本用作自适应 KD 的训练或验证数据。
+
+同一对照计划已有基线 `config.json` 时，可传入 `--reference-config 路径` 核对模型、词表、数据、随机种子和训练预算。KD 组之间还会核对 Teacher 缓存和共有蒸馏参数。该选项可以重复传入，也可以随 `--preflight-only` 单独检查。比较结果时，根据各组的 `status.json` 和 `summary.json` 确认实际完成的训练预算。
+
 数据规模消融给两条对照命令同时加 `--train-size 1000 --subset-seed 42`，或同时改用 4,000 条。采样基于样本 ID 和相同的子集种子，小子集包含在大子集里。现有全量训练清单有 7,887 条，跑全量时省略 `--train-size`。每种规模使用独立输出目录。`--limit-train` 和 `--limit-val` 用于流程试跑。
 
 ## ONNX、INT8 与 CPU 对照
@@ -109,7 +113,7 @@ python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.
 
 `metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。峰值常驻内存来自各自的 NumPy/ONNX Runtime 独立进程，并记录加载模型前的基线。比较时使用同一台机器、同一版本、相同线程数和清单。
 
-CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分，自定义清单和受限样本试跑的结果标为诊断。
+CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分。若模型曾在同一完整测试集上做验证，PyTorch 评估和 ONNX 基准都会拒绝将其用于测试。自定义清单和受限样本试跑的结果标为诊断。
 
 正式的 CPU 对照还会核验 ONNX 记录的 checkpoint 训练清单指纹。旧导出和自定义训练仍支持 CPU 试跑，会标为诊断。旧 ONNX 如需用于正式对照，使用对应 checkpoint 重新导出一对模型。
 

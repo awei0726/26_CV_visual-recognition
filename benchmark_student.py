@@ -81,9 +81,12 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
 
     vocabulary = CharacterVocabulary.from_file(plan["vocabulary"])
     manifest_path = Path(plan["manifest"])
-    manifest_sha = sha256_file(manifest_path)
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     dataset = GridManifest(manifest_path, plan["root"], vocabulary)
     evaluation_split = benchmark_split(dataset)
+    test_manifest_digests = manifest_digests(manifest_bytes) if evaluation_split == "test" else ()
+    del manifest_bytes
     sample_count = len(dataset) if plan["limit"] is None else plan["limit"]
     if sample_count > len(dataset):
         raise ValueError(f"Requested {sample_count} samples but the manifest has {len(dataset)}.")
@@ -101,6 +104,12 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
     rss_after_session = process.memory_info().rss
     if model.metadata["precision"] != precision:
         raise ValueError(f"Expected {precision} metadata in {path}.")
+    if evaluation_split == "test" and (
+        model.metadata.get("validation_manifest_sha256") in test_manifest_digests
+        or (sample_count == len(dataset)
+            and model.metadata.get("validation_data_fingerprint") == fingerprint)
+    ):
+        raise ValueError("The GRID test split was already used for checkpoint validation.")
     if precision == "int8":
         try:
             calibration_ids = json.loads(model.metadata["calibration_sample_ids"])
@@ -199,7 +208,7 @@ def pair_predictions(fp32: dict, int8: dict) -> list[dict]:
     for key in ("model_sha256", "checkpoint_sha256", "vocab_tokens", "preprocessing_version",
                 "model_config", "training_smoke_test", "training_manifest_sha256", "parameters",
                 "training_mode", "training_run_id", "training_epoch", "training_data_fingerprint",
-                "validation_data_fingerprint"):
+                "validation_data_fingerprint", "validation_manifest_sha256"):
         if fp32["model_metadata"].get(key) != int8["model_metadata"].get(key):
             raise ValueError(f"FP32 and INT8 artifacts disagree on {key}. Export them as one pair.")
     if [row["id"] for row in fp32["latency_measurements"]] != [

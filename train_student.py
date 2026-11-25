@@ -30,9 +30,10 @@ from torch.utils.data import DataLoader, Subset
 from student.data import CharacterVocabulary, GridDataset, collate_grid, PREPROCESSING_VERSION
 from student.checkpoint import atomic_json, atomic_save, atomic_text, model_state_sha256, run_lock
 from student.evaluation import evaluate
+from student.experiment import check_reference_config
 from student.losses import adaptive_kd_loss, ctc_loss, standard_kd_loss
 from student.model import StudentModel
-from student.splits import manifest_digests
+from student.splits import GRID_MANIFEST_DIR, manifest_digests
 
 ROOT = Path(__file__).resolve().parent
 GRID_TEACHER_VOCAB = Path("benchmarks/GRID/models/GRID_V_WER4.8/model.json")
@@ -42,6 +43,7 @@ MIDTERM_IMPLEMENTATION_SHA256 = "2f46c006fc6b99538ab299da576520929422a0fb4446405
 COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS = {
     "8cf5485372ea9dcc7b30cf68c55929544ccddabc64977b7e7a9b68d323716c3c",  # aa50ac0, 6545be1
     "d7b68743f417fdd4fc951ea42d95c0e78ab995f6a500fd507cb8ebe2fe9409a5",  # 4e26079
+    "44df44fb01b92ba34f3212ac1958fb56be0f0dcc203215a5bdd98ace36fef9f6",  # 4a85cef
 }
 ADAPTIVE_MODES = ("kd-entropy", "kd-blank")
 FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
@@ -52,6 +54,46 @@ FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
 def resolve(path, root):
     path = Path(path)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def compatible_implementation(digest, mode):
+    return (isinstance(digest, str) and
+            (digest in COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS
+             or (mode in ("ctc", "kd") and digest == MIDTERM_IMPLEMENTATION_SHA256)))
+
+
+def compare_run_references(paths, root, config):
+    checked = []
+    for path in paths:
+        path = resolve(path, root)
+        archive = path.read_bytes()
+        try:
+            reference = json.loads(archive)
+            if not isinstance(reference, dict):
+                raise ValueError("Expected a Student training config JSON object")
+            digest, mode = reference.get("implementation_sha256"), reference.get("mode")
+            compatible = (digest,) if compatible_implementation(digest, mode) else ()
+            check_reference_config(config, reference, compatible_reference_implementations=compatible)
+        except ValueError as error:
+            raise ValueError(f"Reference config {path}: {error}") from error
+        checked.append(dict(path=str(path), mode=mode, run_id=reference.get("run_id"),
+                            sha256=hashlib.sha256(archive).hexdigest()))
+    return checked
+
+
+def check_input_payloads(name, dataset):
+    if isinstance(dataset, Subset):
+        records, indices = dataset.dataset.records, dataset.indices
+    else:
+        records, indices = dataset.records, range(len(dataset))
+    for index in range(len(dataset)):
+        try:
+            dataset[index]
+        except Exception as error:
+            sample_id = records[indices[index]]["id"]
+            raise ValueError(f"{name} preflight sample {sample_id!r} ({index + 1}/{len(dataset)}): {error}") from error
+        if (index + 1) % 2000 == 0:
+            print(f"Checked {index + 1}/{len(dataset)} {name} inputs", flush=True)
 
 
 def select_training_indices(records, size, seed):
@@ -165,7 +207,11 @@ def parse_args(argv=None):
     parser.add_argument("--val-manifest", type=Path, default=Path("data/student_grid/val.jsonl"))
     parser.add_argument("--vocab", type=Path, default=GRID_TEACHER_VOCAB)
     parser.add_argument("--model-config", type=Path, help="JSON object of StudentModel constructor options")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, help="Run output directory, required for training")
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="Validate all selected input payloads and references without training or writing a run")
+    parser.add_argument("--reference-config", type=Path, action="append", default=[],
+                        help="Compare to an existing Student run config.json before training; repeatable")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -197,6 +243,10 @@ def parse_args(argv=None):
                         help="Subset selection seed for --train-size (default: 42)")
     parser.add_argument("--limit-val", type=int, help="First N validation samples, for pipeline checks only")
     args = parser.parse_args(argv)
+    if args.output_dir is None and not args.preflight_only:
+        parser.error("the following arguments are required: --output-dir")
+    if args.preflight_only and args.resume is not None:
+        parser.error("--preflight-only validates a new run; omit --resume")
     for key in ["epochs", "batch_size", "threads", "save_every", "log_every"]:
         if getattr(args, key) <= 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
@@ -233,6 +283,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     root = args.root.resolve()
+    if args.preflight_only:
+        return run(args, root, None)
     output = resolve(args.output_dir, root)
     if args.resume is not None:
         resume_path = resolve(args.resume, root)
@@ -243,7 +295,7 @@ def main(argv=None):
 
 
 def run(args, root, output):
-    if any(path.name != ".run.lock" for path in output.iterdir()) and args.resume is None:
+    if output is not None and any(path.name != ".run.lock" for path in output.iterdir()) and args.resume is None:
         raise ValueError(f"Output directory is not empty: {output}. Use a new directory or --resume.")
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device)
     if device.type not in {"cpu", "cuda"}:
@@ -270,10 +322,10 @@ def run(args, root, output):
         print("Strict deterministic mode: CTC loss/backward uses CPU with GPU autograd transfer.", flush=True)
 
     vocabulary = CharacterVocabulary.from_file(resolve(args.vocab, root))
-    if args.mode in ADAPTIVE_MODES:
+    if args.mode in ADAPTIVE_MODES or (args.mode == "kd" and (args.preflight_only or args.reference_config)):
         teacher_vocabulary = CharacterVocabulary.from_file(ROOT / GRID_TEACHER_VOCAB)
         if vocabulary.tokens != teacher_vocabulary.tokens:
-            raise ValueError("Adaptive KD requires the GRID Teacher's complete token order. "
+            raise ValueError("GRID KD requires the Teacher's complete token order. "
                              "Use the repository vocabulary or an identical copy.")
     model_config = {}
     if args.model_config is not None:
@@ -301,6 +353,16 @@ def run(args, root, output):
     val_files = {val_set.resolve(record["roi"]).resolve() for record in val_set.records}
     if train_files & val_files:
         raise ValueError("Training and validation refer to the same ROI files")
+    if args.mode in ADAPTIVE_MODES or args.preflight_only or args.reference_config:
+        with (ROOT / GRID_MANIFEST_DIR / "test.jsonl").open(encoding="utf-8-sig") as stream:
+            test_rows = [json.loads(line) for line in stream if line.strip()]
+        input_ids, input_files = train_ids | val_ids, train_files | val_files
+        overlap = [row["id"] for row in test_rows
+                   if row["id"] in input_ids or train_set.resolve(row["roi"]).resolve() in input_files]
+        if overlap:
+            raise ValueError(f"The final GRID test split overlaps training or validation: "
+                             f"{len(overlap)} sample(s), including {overlap[0]!r}. "
+                             "Use the training and validation splits for model selection.")
     train_indices = select_training_indices(train_set.records, args.train_size, args.subset_seed)
     print("Fingerprinting training/validation data contents...", flush=True)
     train_fingerprint = train_set.fingerprint(indices=train_indices)
@@ -316,6 +378,44 @@ def run(args, root, output):
         train_set = Subset(train_set, range(min(args.limit_train, len(train_set))))
     if args.limit_val is not None:
         val_set = Subset(val_set, range(min(args.limit_val, len(val_set))))
+    implementation = hashlib.sha256()
+    for relative in ("train_student.py", "student/data.py", "student/grid.py", "student/model.py",
+                     "student/losses.py", "student/evaluation.py", "student/ctc_metrics.py"):
+        implementation.update(relative.encode())
+        implementation.update((ROOT / relative).read_bytes().replace(b"\r\n", b"\n"))
+    runtime_info = dict(python=sys.version.split()[0], torch=str(torch.__version__), numpy=str(np.__version__),
+                        device_type=device.type, gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+                        threads=args.threads, cuda=torch.version.cuda if device.type == "cuda" else None,
+                        cudnn=torch.backends.cudnn.version() if device.type == "cuda" else None,
+                        platform=platform.platform())
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+              if key not in {"preflight_only", "reference_config"}}
+    config.update({key: hashlib.sha256(data).hexdigest() for key, data in manifest_bytes.items()})
+    config.update(root=str(root), output_dir=str(output) if output is not None else None, device=str(device),
+                  model_config=model_config, vocab_tokens=vocabulary.tokens,
+                  train_samples=len(train_set), val_samples=len(val_set),
+                  parameters=model.count_parameters(), torch_version=str(torch.__version__),
+                  numpy_version=str(np.__version__), decoder="ctc_greedy", metric_unit="ratio",
+                  preprocessing_version=PREPROCESSING_VERSION, train_data_fingerprint=train_fingerprint,
+                  train_roi_fingerprint=train_roi_fingerprint, val_data_fingerprint=val_fingerprint,
+                  implementation_sha256=implementation.hexdigest(),
+                  runtime_info=runtime_info,
+                  smoke_test=args.smoke_test or args.limit_train is not None or args.limit_val is not None)
+    if args.reference_config:
+        config["reference_configs"] = compare_run_references(args.reference_config, root, config)
+    if args.preflight_only:
+        check_input_payloads("training", train_set)
+        check_input_payloads("validation", val_set)
+        for key, path in manifest_paths.items():
+            if path.read_bytes() != manifest_bytes[key]:
+                raise ValueError(f"Manifest changed during preflight: {path}")
+        result = {"preflight_status": "passed", "mode": args.mode, "device": str(device),
+                  "train_samples": len(train_set), "val_samples": len(val_set),
+                  "train_roi_fingerprint": train_roi_fingerprint, "train_data_fingerprint": train_fingerprint,
+                  "val_data_fingerprint": val_fingerprint, "smoke_test": config["smoke_test"],
+                  "references_checked": config.get("reference_configs", [])}
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return result
     generator = torch.Generator().manual_seed(args.seed)
     # A separate validation generator prevents validation workers from consuming
     # the global dropout RNG. No stochastic data augmentation is used.
@@ -328,28 +428,6 @@ def run(args, root, output):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
                                                        patience=args.lr_patience, min_lr=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp, init_scale=args.amp_init_scale)
-    implementation = hashlib.sha256()
-    for relative in ("train_student.py", "student/data.py", "student/grid.py", "student/model.py",
-                     "student/losses.py", "student/evaluation.py", "student/ctc_metrics.py"):
-        implementation.update(relative.encode())
-        implementation.update((ROOT / relative).read_bytes().replace(b"\r\n", b"\n"))
-    runtime_info = dict(python=sys.version.split()[0], torch=str(torch.__version__), numpy=str(np.__version__),
-                        device_type=device.type, gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-                        threads=args.threads, cuda=torch.version.cuda if device.type == "cuda" else None,
-                        cudnn=torch.backends.cudnn.version() if device.type == "cuda" else None,
-                        platform=platform.platform())
-    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    config.update({key: hashlib.sha256(data).hexdigest() for key, data in manifest_bytes.items()})
-    config.update(root=str(root), output_dir=str(output), device=str(device),
-                  model_config=model_config, vocab_tokens=vocabulary.tokens,
-                  train_samples=len(train_set), val_samples=len(val_set),
-                  parameters=model.count_parameters(), torch_version=str(torch.__version__),
-                  numpy_version=str(np.__version__), decoder="ctc_greedy", metric_unit="ratio",
-                  preprocessing_version=PREPROCESSING_VERSION, train_data_fingerprint=train_fingerprint,
-                  train_roi_fingerprint=train_roi_fingerprint, val_data_fingerprint=val_fingerprint,
-                  implementation_sha256=implementation.hexdigest(),
-                  runtime_info=runtime_info,
-                  smoke_test=args.smoke_test or args.limit_train is not None or args.limit_val is not None)
     start_epoch, best_score, history = 1, (float("inf"),)*3, []
     best_epoch, best_digest, run_id = None, None, uuid.uuid4().hex
     if args.resume is not None:
@@ -371,8 +449,7 @@ def run(args, root, output):
                      "implementation_sha256", "preprocessing_version", "smoke_test", "train_roi_fingerprint"]
         previous_config = checkpoint["config"]
         previous_implementation = previous_config.get("implementation_sha256")
-        if (previous_implementation in COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS
-                or (args.mode in ("ctc", "kd") and previous_implementation == MIDTERM_IMPLEMENTATION_SHA256)):
+        if compatible_implementation(previous_implementation, args.mode):
             immutable.remove("implementation_sha256")
         changed = [key for key in immutable if previous_config.get(key) != config.get(key)]
         changed.extend(key for key, data in manifest_bytes.items()

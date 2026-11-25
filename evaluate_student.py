@@ -17,7 +17,7 @@ from student.data import (
 from student.evaluation import evaluate
 from student.checkpoint import atomic_json, model_state_sha256, run_lock
 from student.model import StudentModel
-from student.splits import manifest_digests, training_manifest_overlap
+from student.splits import is_held_out_split, manifest_digests, training_manifest_overlap
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -145,6 +145,9 @@ def main(argv=None):
                 and trained_val_fingerprint != evaluation_data_fingerprint):
             raise ValueError("Validation data differs from the ROI and labels recorded in the checkpoint. "
                              "Restore the training run's validation data before comparing scores.")
+        if ((matches_validation_manifest or trained_val_fingerprint == evaluation_data_fingerprint)
+                and is_held_out_split(dataset, "test")):
+            raise ValueError("The GRID test split was already used for checkpoint validation.")
         validation_data_verified = None
         if trained_val_fingerprint is not None:
             # The trainer fingerprints the manifest before applying --limit-val.

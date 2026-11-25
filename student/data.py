@@ -50,9 +50,10 @@ class GridDataset(GridManifest, Dataset):
                 or cache_blank != self.vocabulary.blank_id
             ):
                 raise ValueError(f"{record['id']}: teacher shape, length, blank_id or dtype mismatch")
+            logits = logits.float()
             if not torch.isfinite(logits).all():
                 raise ValueError(f"{record['id']}: teacher logits contain NaN or Inf")
-            item["teacher"] = logits.float()
+            item["teacher"] = logits
         return item
 
 

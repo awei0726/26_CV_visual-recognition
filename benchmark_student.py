@@ -14,11 +14,10 @@ import tempfile
 from time import perf_counter_ns
 
 import numpy as np
-import torch
 
 from student.checkpoint import atomic_json, atomic_text, run_lock
-from student.data import CharacterVocabulary, GridDataset, PREPROCESSING_VERSION
-from student.evaluation import edit_distance
+from student.ctc_metrics import edit_distance
+from student.grid import CharacterVocabulary, GridManifest, PREPROCESSING_VERSION
 from student.onnx_runtime import OnnxStudent
 from student.splits import benchmark_split, GRID_TRAIN_MANIFEST, manifest_digests
 
@@ -58,7 +57,7 @@ def latency_summary(samples: list[float]) -> dict:
 
 
 def session_inputs(model: OnnxStudent, sample: dict) -> dict[str, np.ndarray]:
-    frames = sample["frames"].unsqueeze(0).numpy()
+    frames = sample["frames"][None, ...]
     lengths = np.array([sample["length"]], dtype=np.int64)
     return model.prepare_inputs(frames, lengths)
 
@@ -80,11 +79,10 @@ def evaluate_variant(plan: dict, precision: str) -> dict:
     """Run one model in a fresh subprocess using only the CPU provider."""
     import psutil
 
-    torch.set_num_threads(1)
     vocabulary = CharacterVocabulary.from_file(plan["vocabulary"])
     manifest_path = Path(plan["manifest"])
     manifest_sha = sha256_file(manifest_path)
-    dataset = GridDataset(manifest_path, plan["root"], vocabulary, load_teacher=False)
+    dataset = GridManifest(manifest_path, plan["root"], vocabulary)
     evaluation_split = benchmark_split(dataset)
     sample_count = len(dataset) if plan["limit"] is None else plan["limit"]
     if sample_count > len(dataset):
@@ -199,7 +197,9 @@ def pair_predictions(fp32: dict, int8: dict) -> list[dict]:
     )):
         raise ValueError("The two benchmarks did not evaluate the same GRID data.")
     for key in ("model_sha256", "checkpoint_sha256", "vocab_tokens", "preprocessing_version",
-                "model_config", "training_smoke_test", "training_manifest_sha256", "parameters"):
+                "model_config", "training_smoke_test", "training_manifest_sha256", "parameters",
+                "training_mode", "training_run_id", "training_epoch", "training_data_fingerprint",
+                "validation_data_fingerprint"):
         if fp32["model_metadata"].get(key) != int8["model_metadata"].get(key):
             raise ValueError(f"FP32 and INT8 artifacts disagree on {key}. Export them as one pair.")
     if [row["id"] for row in fp32["latency_measurements"]] != [
@@ -299,7 +299,7 @@ def main(argv=None) -> dict:
                     "warmup_calls_per_model": args.warmup,
                     "evaluation_order": ["fp32", "int8"],
                     "latency_scope": "One ONNX Runtime session.run per timed video, excluding file I/O, ROI normalization and decoding.",
-                    "peak_rss_scope": "Lifetime RSS high-water mark of each isolated benchmark worker, including imports, model load and inference. The pre-session high-water mark is recorded separately.",
+                    "peak_rss_scope": "Lifetime RSS high-water mark of each isolated NumPy/ONNX Runtime worker, including imports, input loading, model load and inference. The pre-session high-water mark is recorded separately.",
                     "python_version": platform.python_version(),
                     "onnxruntime_version": ort.__version__,
                     "platform": platform.platform(),

@@ -35,10 +35,14 @@ from student.model import StudentModel
 from student.splits import manifest_digests
 
 ROOT = Path(__file__).resolve().parent
+GRID_TEACHER_VOCAB = Path("benchmarks/GRID/models/GRID_V_WER4.8/model.json")
 # Exact implementation fingerprint of the compatible midterm release (ec3836d).
 MIDTERM_IMPLEMENTATION_SHA256 = "2f46c006fc6b99538ab299da576520929422a0fb44464059e2343396c018cc37"
-# Prior adaptive release used the same training math (aa50ac0 and 6545be1).
-PRE_PORTABLE_IMPLEMENTATION_SHA256 = "8cf5485372ea9dcc7b30cf68c55929544ccddabc64977b7e7a9b68d323716c3c"
+# These adaptive releases used the same training math and data conventions.
+COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS = {
+    "8cf5485372ea9dcc7b30cf68c55929544ccddabc64977b7e7a9b68d323716c3c",  # aa50ac0, 6545be1
+    "d7b68743f417fdd4fc951ea42d95c0e78ab995f6a500fd507cb8ebe2fe9409a5",  # 4e26079
+}
 ADAPTIVE_MODES = ("kd-entropy", "kd-blank")
 FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
           "val_cer", "lr", "next_lr", "seconds", "peak_cuda_mib", "train_samples", "val_samples",
@@ -159,7 +163,7 @@ def parse_args(argv=None):
                         help="CTC only, standard KD, entropy-aware KD, or entropy+blank-aware KD")
     parser.add_argument("--train-manifest", type=Path, default=Path("data/student_grid/train.jsonl"))
     parser.add_argument("--val-manifest", type=Path, default=Path("data/student_grid/val.jsonl"))
-    parser.add_argument("--vocab", type=Path, default=Path("benchmarks/GRID/models/GRID_V_WER4.8/model.json"))
+    parser.add_argument("--vocab", type=Path, default=GRID_TEACHER_VOCAB)
     parser.add_argument("--model-config", type=Path, help="JSON object of StudentModel constructor options")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=60)
@@ -266,6 +270,11 @@ def run(args, root, output):
         print("Strict deterministic mode: CTC loss/backward uses CPU with GPU autograd transfer.", flush=True)
 
     vocabulary = CharacterVocabulary.from_file(resolve(args.vocab, root))
+    if args.mode in ADAPTIVE_MODES:
+        teacher_vocabulary = CharacterVocabulary.from_file(ROOT / GRID_TEACHER_VOCAB)
+        if vocabulary.tokens != teacher_vocabulary.tokens:
+            raise ValueError("Adaptive KD requires the GRID Teacher's complete token order. "
+                             "Use the repository vocabulary or an identical copy.")
     model_config = {}
     if args.model_config is not None:
         model_config = json.loads(resolve(args.model_config, root).read_text(encoding="utf-8"))
@@ -320,7 +329,8 @@ def run(args, root, output):
                                                        patience=args.lr_patience, min_lr=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp, init_scale=args.amp_init_scale)
     implementation = hashlib.sha256()
-    for relative in ["train_student.py", "student/data.py", "student/model.py", "student/losses.py", "student/evaluation.py"]:
+    for relative in ("train_student.py", "student/data.py", "student/grid.py", "student/model.py",
+                     "student/losses.py", "student/evaluation.py", "student/ctc_metrics.py"):
         implementation.update(relative.encode())
         implementation.update((ROOT / relative).read_bytes().replace(b"\r\n", b"\n"))
     runtime_info = dict(python=sys.version.split()[0], torch=str(torch.__version__), numpy=str(np.__version__),
@@ -361,7 +371,7 @@ def run(args, root, output):
                      "implementation_sha256", "preprocessing_version", "smoke_test", "train_roi_fingerprint"]
         previous_config = checkpoint["config"]
         previous_implementation = previous_config.get("implementation_sha256")
-        if (previous_implementation == PRE_PORTABLE_IMPLEMENTATION_SHA256
+        if (previous_implementation in COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS
                 or (args.mode in ("ctc", "kd") and previous_implementation == MIDTERM_IMPLEMENTATION_SHA256)):
             immutable.remove("implementation_sha256")
         changed = [key for key in immutable if previous_config.get(key) != config.get(key)]

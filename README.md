@@ -79,6 +79,8 @@ python evaluate_student.py --checkpoint output/student_midterm/kd/best.pt --mani
 
 两种自适应模式根据未加温的 Teacher 概率计算帧权重，`--kd-epsilon` 默认 0.1。只对有效帧归一化，使平均权重为 1。蒸馏项仍使用相同温度和温度平方缩放。
 
+自适应 KD 会检查完整的 Teacher 词表顺序，支持仓库的词表或内容相同的副本。比较 E2–E4 时，核对独立评估记录里的 `training_data_fingerprint`，它包含训练 ROI 和 Teacher 缓存内容。与纯 CTC 对照时，核对 `training_roi_fingerprint`。
+
 ```sh
 python train_student.py --mode kd-entropy --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/entropy
 python train_student.py --mode kd-blank --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/blank
@@ -99,11 +101,13 @@ python export_student.py --checkpoint output/student_final/blank/best.pt --outpu
 
 用同一份评估清单比较两种精度。验证集用于调试和选择配置，定稿后用测试清单做最终比较。
 
+CPU 对照和预裁剪 ROI 推理只需要 NumPy、ONNX Runtime 和测量依赖，可在单独的 Python 3.11 环境中安装 `requirements-runtime.txt`。
+
 ```sh
 python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.onnx --int8 output/student_final/blank_onnx/student_int8.onnx --manifest data/student_grid/val.jsonl --output-dir output/student_final/blank_benchmark --threads 1
 ```
 
-`metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。每种精度在独立进程测峰值常驻内存，并记录加载模型前的基线。同一台机器、相同线程数和相同清单才适合直接比较。
+`metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。峰值常驻内存来自各自的 NumPy/ONNX Runtime 独立进程，并记录加载模型前的基线。比较时使用同一台机器、同一版本、相同线程数和清单。
 
 CPU 对照会检查清单是否包含 GRID 训练样本，并在推理前后校验清单和 ROI 文件。完整的仓库验证集或测试集会标为对应划分，自定义清单和受限样本试跑的结果标为诊断。
 

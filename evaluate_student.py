@@ -194,6 +194,7 @@ def main(argv=None):
             "training_validation_samples": training_config.get("val_samples"),
             "training_manifest_sha256": training_config.get("train_manifest_sha256"),
             "training_validation_manifest_sha256": training_config.get("val_manifest_sha256"),
+            "training_data_fingerprint": training_config.get("train_data_fingerprint"),
             "training_roi_fingerprint": training_config.get("train_roi_fingerprint"),
             "training_validation_roi_fingerprint": trained_val_fingerprint,
             "training_implementation_sha256": training_config.get("implementation_sha256"),

@@ -28,10 +28,10 @@ def main(argv=None):
         from student.video import extract_video_roi
 
         roi = extract_video_roi(args.video, max_frames=args.max_frames)
-    from student.data import normalize_roi
+    from student.grid import normalize_roi_numpy
     from student.onnx_runtime import OnnxStudent
 
-    frames = normalize_roi(roi).unsqueeze(0).numpy()
+    frames = normalize_roi_numpy(roi)[None, ...]
     lengths = np.array([frames.shape[1]], dtype=np.int64)
     student = OnnxStudent(args.model, threads=args.threads)
     print(student.predict(frames, lengths)[0])

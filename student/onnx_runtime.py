@@ -7,10 +7,9 @@ from pathlib import Path
 import re
 
 import numpy as np
-import torch
 
-from .data import CharacterVocabulary, INPUT_SIZE, PREPROCESSING_VERSION
-from .evaluation import greedy_decode
+from .ctc_metrics import decode_ctc_path
+from .grid import CharacterVocabulary, INPUT_SIZE, PREPROCESSING_VERSION
 
 
 class OnnxStudent:
@@ -114,7 +113,22 @@ class OnnxStudent:
         return logits
 
     def decode(self, logits: np.ndarray, lengths: np.ndarray) -> list[str]:
-        return greedy_decode(torch.from_numpy(logits), lengths, self.vocabulary)
+        if (not isinstance(logits, np.ndarray) or logits.ndim != 3 or min(logits.shape[:2]) < 1
+                or logits.shape[-1] != self.vocabulary.size or not np.issubdtype(logits.dtype, np.floating)):
+            raise ValueError("Expected logits [B, T, vocabulary.size].")
+        lengths = np.asarray(lengths)
+        if lengths.dtype not in (np.int32, np.int64):
+            raise ValueError("input_lengths must contain integers; fractional lengths are invalid.")
+        if lengths.shape != (logits.shape[0],):
+            raise ValueError("input_lengths must contain one length per sample.")
+        if np.any(lengths < 1) or np.any(lengths > logits.shape[1]):
+            raise ValueError("input_lengths must lie between 1 and the logits time dimension.")
+        valid = np.arange(logits.shape[1])[None, :] < lengths[:, None]
+        if not np.isfinite(logits[valid]).all():
+            raise ValueError("ONNX Student logits contain NaN or Inf in valid frames.")
+        paths = logits.argmax(axis=-1).tolist()
+        return [decode_ctc_path(path[:length], self.vocabulary)
+                for path, length in zip(paths, lengths.tolist())]
 
     def predict(self, frames: np.ndarray, lengths: np.ndarray) -> list[str]:
         return self.decode(self.run(frames, lengths), lengths)

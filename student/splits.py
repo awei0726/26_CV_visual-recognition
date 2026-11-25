@@ -3,7 +3,7 @@
 import hashlib
 from pathlib import Path
 
-from .data import GridDataset
+from .grid import GridManifest
 
 
 GRID_MANIFEST_DIR = Path("data/student_grid")
@@ -21,18 +21,18 @@ def manifest_digests(data: bytes) -> set[str]:
             for raw in (data, lf, lf.replace(b"\n", b"\r\n"))}
 
 
-def _reference(dataset: GridDataset, path: Path) -> GridDataset:
-    return GridDataset(path, dataset.root, dataset.vocabulary, validate=False)
+def _reference(dataset: GridManifest, path: Path) -> GridManifest:
+    return GridManifest(path, dataset.root, dataset.vocabulary, validate=False)
 
 
-def _overlap(dataset: GridDataset, reference: GridDataset) -> int:
+def _overlap(dataset: GridManifest, reference: GridManifest) -> int:
     reference_ids = {row["id"] for row in reference.records}
     reference_rois = {reference.resolve(row["roi"]).resolve() for row in reference.records}
     return sum(row["id"] in reference_ids or dataset.resolve(row["roi"]).resolve() in reference_rois
                for row in dataset.records)
 
 
-def training_manifest_overlap(dataset: GridDataset, training_config: dict) -> int | None:
+def training_manifest_overlap(dataset: GridManifest, training_config: dict) -> int | None:
     """Count overlaps with the checkpoint's original training pool when available."""
     digest = training_config.get("train_manifest_sha256")
     if not isinstance(digest, str):
@@ -47,12 +47,12 @@ def training_manifest_overlap(dataset: GridDataset, training_config: dict) -> in
     return None
 
 
-def _samples(dataset: GridDataset) -> set[tuple]:
+def _samples(dataset: GridManifest) -> set[tuple]:
     return {(row["id"], row["text"], row["length"], dataset.resolve(row["roi"]).resolve())
             for row in dataset.records}
 
 
-def benchmark_split(dataset: GridDataset) -> str:
+def benchmark_split(dataset: GridManifest) -> str:
     """Identify a complete GRID held-out split and reject training-pool leakage."""
     train = dataset.root / GRID_TRAIN_MANIFEST
     if not train.is_file():

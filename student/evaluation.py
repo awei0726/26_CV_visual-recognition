@@ -8,22 +8,8 @@ import tempfile
 
 import torch
 
+from .ctc_metrics import decode_ctc_path, edit_distance
 from .losses import ctc_loss
-
-
-def edit_distance(hypothesis, reference):
-    """Return Levenshtein edits for either character or word sequences."""
-    previous = list(range(len(reference) + 1))
-    for index, token in enumerate(hypothesis, start=1):
-        current = [index]
-        for offset, expected in enumerate(reference, start=1):
-            current.append(min(
-                previous[offset] + 1,
-                current[offset - 1] + 1,
-                previous[offset - 1] + (token != expected),
-            ))
-        previous = current
-    return previous[-1]
 
 
 def greedy_decode(logits, input_lengths, vocabulary):
@@ -46,13 +32,9 @@ def greedy_decode(logits, input_lengths, vocabulary):
     if not torch.isfinite(logits[valid]).all():
         raise ValueError("Student logits contain NaN or Inf.")
 
-    paths = logits.detach().argmax(dim=-1).cpu()
-    predictions = []
-    for path, length in zip(paths, lengths.tolist()):
-        collapsed = torch.unique_consecutive(path[:length]).tolist()
-        tokens = [token for token in collapsed if token != vocabulary.blank_id]
-        predictions.append(vocabulary.decode(tokens))
-    return predictions
+    paths = logits.detach().argmax(dim=-1).cpu().tolist()
+    return [decode_ctc_path(path[:length], vocabulary)
+            for path, length in zip(paths, lengths.tolist())]
 
 
 @torch.inference_mode()

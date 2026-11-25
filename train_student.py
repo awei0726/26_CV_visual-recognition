@@ -1,4 +1,4 @@
-"""Train the GRID Student with CTC supervision, optionally with standard KD."""
+"""Train the GRID Student with CTC, standard KD or adaptive temporal KD."""
 
 from __future__ import annotations
 
@@ -30,10 +30,13 @@ from torch.utils.data import DataLoader, Subset
 from student.data import CharacterVocabulary, GridDataset, collate_grid, PREPROCESSING_VERSION
 from student.checkpoint import atomic_json, atomic_save, atomic_text, model_state_sha256, run_lock
 from student.evaluation import evaluate
-from student.losses import ctc_loss, standard_kd_loss
+from student.losses import adaptive_kd_loss, ctc_loss, standard_kd_loss
 from student.model import StudentModel
 
 ROOT = Path(__file__).resolve().parent
+# Exact implementation fingerprint of the compatible midterm release (ec3836d).
+MIDTERM_IMPLEMENTATION_SHA256 = "2f46c006fc6b99538ab299da576520929422a0fb44464059e2343396c018cc37"
+ADAPTIVE_MODES = ("kd-entropy", "kd-blank")
 FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
           "val_cer", "lr", "next_lr", "seconds", "peak_cuda_mib", "train_samples", "val_samples",
           "optimizer_steps", "amp_skipped_steps"]
@@ -42,6 +45,20 @@ FIELDS = ["epoch", "train_loss", "train_ctc", "train_kd", "val_loss", "val_wer",
 def resolve(path, root):
     path = Path(path)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def select_training_indices(records, size, seed):
+    """Rank IDs deterministically for nested subsets, then retain manifest order."""
+    if size is None or size == len(records):
+        return None
+    if not 0 < size < len(records):
+        raise ValueError(f"--train-size must be in [1, {len(records)}] for this manifest")
+
+    def rank(index):
+        sample_id = records[index]["id"]
+        return hashlib.sha256(f"{seed}\n{sample_id}".encode("utf-8")).digest(), sample_id
+
+    return sorted(sorted(range(len(records)), key=rank)[:size])
 
 
 def save_atomic(value, path):
@@ -77,6 +94,7 @@ def restore_rng(state, device):
 
 def train_epoch(model, loader, optimizer, scaler, device, vocabulary, args):
     model.train()
+    distill = args.mode != "ctc"
     totals = dict(ctc=0.0, kd=0.0, samples=0, valid_frames=0, optimizer_steps=0, amp_skipped_steps=0)
     for step, batch in enumerate(loader, 1):
         frames = batch["frames"].to(device, non_blocking=True)
@@ -88,10 +106,15 @@ def train_epoch(model, loader, optimizer, scaler, device, vocabulary, args):
         # CTC and KL must be computed in FP32, outside mixed-precision autocast.
         ctc = ctc_loss(logits, targets, lengths, target_lengths, blank_id=vocabulary.blank_id)
         kd = logits.new_zeros((), dtype=torch.float32)
-        if args.mode == "kd":
+        if distill:
             teacher = batch["teacher"].to(device, non_blocking=True)
-            kd = standard_kd_loss(logits, teacher, lengths, args.temperature)
-        loss = ctc + (args.kd_weight * kd if args.mode == "kd" else 0)
+            if args.mode == "kd":
+                kd = standard_kd_loss(logits, teacher, lengths, args.temperature)
+            else:
+                blank_id = vocabulary.blank_id if args.mode == "kd-blank" else None
+                kd = adaptive_kd_loss(logits, teacher, lengths, args.temperature,
+                                      epsilon=args.kd_epsilon, blank_id=blank_id)
+        loss = ctc + (args.kd_weight * kd if distill else 0)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss at batch {step}: {batch['ids']}")
         scaler.scale(loss).backward()
@@ -122,14 +145,15 @@ def train_epoch(model, loader, optimizer, scaler, device, vocabulary, args):
                                  "lower --amp-init-scale or retry without --amp.")
     totals["ctc"] /= totals["samples"]
     totals["kd"] /= totals["valid_frames"]
-    totals["loss"] = totals["ctc"] + (args.kd_weight * totals["kd"] if args.mode == "kd" else 0)
+    totals["loss"] = totals["ctc"] + (args.kd_weight * totals["kd"] if distill else 0)
     return totals
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--mode", choices=["ctc", "kd"], default="ctc")
+    parser.add_argument("--mode", choices=("ctc", "kd", *ADAPTIVE_MODES), default="ctc",
+                        help="CTC only, standard KD, entropy-aware KD, or entropy+blank-aware KD")
     parser.add_argument("--train-manifest", type=Path, default=Path("data/student_grid/train.jsonl"))
     parser.add_argument("--val-manifest", type=Path, default=Path("data/student_grid/val.jsonl"))
     parser.add_argument("--vocab", type=Path, default=Path("benchmarks/GRID/models/GRID_V_WER4.8/model.json"))
@@ -141,6 +165,8 @@ def parse_args(argv=None):
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--kd-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument("--kd-epsilon", type=float,
+                        help="Adaptive KD weight floor in (0, 1] (adaptive default: 0.1)")
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--lr-patience", type=int, default=5)
     parser.add_argument("--lr-monitor", choices=["val_loss", "val_wer"], default="val_loss")
@@ -155,7 +181,13 @@ def parse_args(argv=None):
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--resume", type=Path, help="Epoch-boundary checkpoint; repeat original training options")
     parser.add_argument("--smoke-test", action="store_true", help="Label a pipeline-only run, including custom manifests")
-    parser.add_argument("--limit-train", type=int, help="First N training samples, for pipeline checks only")
+    train_selection = parser.add_mutually_exclusive_group()
+    train_selection.add_argument("--limit-train", type=int,
+                                 help="First N training samples, for pipeline checks only")
+    train_selection.add_argument("--train-size", type=int,
+                                 help="Deterministic nested training subset for a formal data-scale ablation")
+    parser.add_argument("--subset-seed", type=int,
+                        help="Subset selection seed for --train-size (default: 42)")
     parser.add_argument("--limit-val", type=int, help="First N validation samples, for pipeline checks only")
     args = parser.parse_args(argv)
     for key in ["epochs", "batch_size", "threads", "save_every", "log_every"]:
@@ -171,11 +203,23 @@ def parse_args(argv=None):
         parser.error("workers and lr-patience must be nonnegative")
     if not 0 <= args.seed < 2**32:
         parser.error("--seed must be in [0, 2**32)")
-    if args.mode == "kd" and args.kd_weight == 0:
+    if args.mode != "ctc" and args.kd_weight == 0:
         parser.error("KD mode requires --kd-weight > 0; use --mode ctc for the baseline")
-    for key in ["limit_train", "limit_val"]:
+    if args.mode in ADAPTIVE_MODES:
+        args.kd_epsilon = 0.1 if args.kd_epsilon is None else args.kd_epsilon
+        if not math.isfinite(args.kd_epsilon) or not 0 < args.kd_epsilon <= 1:
+            parser.error("--kd-epsilon must be finite and in (0, 1]")
+    elif args.kd_epsilon is not None:
+        parser.error("--kd-epsilon requires --mode kd-entropy or kd-blank")
+    for key in ["limit_train", "limit_val", "train_size"]:
         if getattr(args, key) is not None and getattr(args, key) <= 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
+    if args.train_size is not None:
+        args.subset_seed = 42 if args.subset_seed is None else args.subset_seed
+        if not 0 <= args.subset_seed < 2**32:
+            parser.error("--subset-seed must be in [0, 2**32)")
+    elif args.subset_seed is not None:
+        parser.error("--subset-seed requires --train-size")
     return args
 
 
@@ -229,7 +273,7 @@ def run(args, root, output):
     model_config = model.get_config()
 
     train_path, val_path = resolve(args.train_manifest, root), resolve(args.val_manifest, root)
-    train_set = GridDataset(train_path, root, vocabulary, load_teacher=args.mode == "kd")
+    train_set = GridDataset(train_path, root, vocabulary, load_teacher=args.mode != "ctc")
     val_set = GridDataset(val_path, root, vocabulary, load_teacher=False)
     train_ids = {record["id"] for record in train_set.records}
     val_ids = {record["id"] for record in val_set.records}
@@ -243,11 +287,15 @@ def run(args, root, output):
     val_files = {val_set.resolve(record["roi"]).resolve() for record in val_set.records}
     if train_files & val_files:
         raise ValueError("Training and validation refer to the same ROI files")
+    train_indices = select_training_indices(train_set.records, args.train_size, args.subset_seed)
     print("Fingerprinting training/validation data contents...", flush=True)
-    train_fingerprint = train_set.fingerprint()
-    train_roi_fingerprint = train_fingerprint if args.mode == "ctc" else train_set.fingerprint(include_teacher=False)
+    train_fingerprint = train_set.fingerprint(indices=train_indices)
+    train_roi_fingerprint = (train_fingerprint if args.mode == "ctc"
+                             else train_set.fingerprint(include_teacher=False, indices=train_indices))
     val_fingerprint = val_set.fingerprint()
-    if args.limit_train is not None:
+    if train_indices is not None:
+        train_set = Subset(train_set, train_indices)
+    elif args.limit_train is not None:
         train_set = Subset(train_set, range(min(args.limit_train, len(train_set))))
     if args.limit_val is not None:
         val_set = Subset(val_set, range(min(args.limit_val, len(val_set))))
@@ -299,12 +347,16 @@ def run(args, root, output):
             saved_config = json.loads(existing_config.read_text(encoding="utf-8"))
             if saved_config.get("run_id") != checkpoint["run_id"]:
                 raise ValueError("Checkpoint run ID differs from the output directory's existing experiment")
-        immutable = ["mode", "batch_size", "lr", "weight_decay", "kd_weight", "temperature",
+        immutable = ["mode", "batch_size", "lr", "weight_decay", "kd_weight", "temperature", "kd_epsilon",
                      "grad_clip", "lr_patience", "lr_monitor", "seed", "amp", "amp_init_scale", "deterministic", "workers",
-                     "limit_train", "limit_val", "model_config", "vocab_tokens",
+                     "limit_train", "limit_val", "train_size", "subset_seed", "model_config", "vocab_tokens",
                      "train_manifest_sha256", "val_manifest_sha256", "train_data_fingerprint", "val_data_fingerprint",
                      "implementation_sha256", "preprocessing_version", "smoke_test", "train_roi_fingerprint"]
-        changed = [key for key in immutable if checkpoint["config"].get(key) != config.get(key)]
+        previous_config = checkpoint["config"]
+        if (args.mode in ("ctc", "kd") and
+                previous_config.get("implementation_sha256") == MIDTERM_IMPLEMENTATION_SHA256):
+            immutable.remove("implementation_sha256")
+        changed = [key for key in immutable if previous_config.get(key) != config.get(key)]
         if changed:
             raise ValueError(f"Resume options differ for {changed}; repeat original options")
         if model_state_sha256(checkpoint["model_state"]) != checkpoint["model_sha256"]:

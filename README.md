@@ -64,6 +64,67 @@ python evaluate_student.py --checkpoint output/student_midterm/kd/best.pt --mani
 
 `metrics.json` 中的 WER 和 CER 为比率，`predictions.jsonl` 保存逐样本结果。报告时说明结果基于当前 Student 划分和给定 Teacher。按样本 ID 对照，仓库的 Teacher 训练参考清单覆盖本次 Student 验证集的 2,000 条样本。
 
+## 后续蒸馏实验
+
+在相同的 Student 模型、数据划分、随机种子和训练预算下比较四组。各组从同一初始化规则开始，独立保存 checkpoint。
+
+| 组别 | 模式 | 训练目标 |
+| --- | --- | --- |
+| E1 | `ctc` | CTC 监督 |
+| E2 | `kd` | CTC 加均匀的有效帧蒸馏 |
+| E3 | `kd-entropy` | CTC 加按 Teacher 预测熵调整权重的蒸馏 |
+| E4 | `kd-blank` | CTC 加同时考虑预测熵和 Blank 概率的蒸馏 |
+
+两种自适应模式根据未加温的 Teacher 概率计算帧权重，`--kd-epsilon` 默认 0.1。只对有效帧归一化，使平均权重为 1。蒸馏项仍使用相同温度和温度平方缩放。
+
+```sh
+python train_student.py --mode kd-entropy --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/entropy
+python train_student.py --mode kd-blank --epochs 60 --batch-size 8 --seed 42 --temperature 2 --kd-weight 0.5 --kd-epsilon 0.1 --output-dir output/student_final/blank
+```
+
+数据规模消融给两条对照命令同时加 `--train-size 1000 --subset-seed 42`，或同时改用 4,000 条。采样基于样本 ID 和相同的子集种子，小子集包含在大子集里。现有全量训练清单有 7,887 条，跑全量时省略 `--train-size`。每种规模使用独立输出目录。`--limit-train` 和 `--limit-val` 用于流程试跑。
+
+## ONNX、INT8 与 CPU 对照
+
+在 Student 环境内安装部署依赖。导出脚本接受已有 Student checkpoint，运行时只需要 Student 模型。默认使用训练清单中固定种子选出的 128 个样本做静态 QDQ 校准。
+
+```sh
+python -m pip install -r requirements-deployment.txt
+python export_student.py --checkpoint output/student_final/blank/best.pt --output-dir output/student_final/blank_onnx
+```
+
+导出目录包含 `student_fp32.onnx`、`student_int8.onnx` 和 `export_report.json`。报告记录 checkpoint、校准样本、量化节点和导出自检。给 `export_student.py` 加 `--fp32-only` 可单独导出 FP32。
+
+用同一份评估清单比较两种精度。验证集用于调试和选择配置，定稿后用测试清单做最终比较。
+
+```sh
+python benchmark_student.py --fp32 output/student_final/blank_onnx/student_fp32.onnx --int8 output/student_final/blank_onnx/student_int8.onnx --manifest data/student_grid/val.jsonl --output-dir output/student_final/blank_benchmark --threads 1
+```
+
+`metrics.json` 记录 WER/CER、模型大小、CPU 延迟和峰值内存。`predictions.jsonl` 按样本保存两种精度的预测。CPU 延迟统计单视频的 ONNX Runtime 调用，预处理和解码在计时之外。每种精度在独立进程测峰值常驻内存，并记录加载模型前的基线。同一台机器、相同线程数和相同清单才适合直接比较。
+
+最终测试时从仓库根目录取得测试包，再把评估命令的 `--manifest` 指向 `data/student_grid/test.jsonl`，使用新的输出目录。
+
+```sh
+git lfs pull --include="training-data/grid-test.tar.gz" --exclude=""
+tar -xzf training-data/grid-test.tar.gz
+```
+
+## 单视频演示
+
+准备好的灰度 ROI 可以直接输入 ONNX Student。
+
+```sh
+python predict_student.py --model output/student_final/blank_onnx/student_int8.onnx --roi data/student_grid/roi/s9/bbae4n.npy
+```
+
+处理原始视频时，在独立的 Python 3.11 环境安装 `requirements-video.txt`。演示沿用项目的 MediaPipe 人脸对齐和灰度口型裁剪，适用于单人、正脸、接近 GRID 采集条件的短片。
+
+```sh
+python -m pip install -r requirements-video.txt
+python predict_student.py --model output/student_final/blank_onnx/student_int8.onnx --video path/to/clip.mpg
+```
+
 ## 重新生成输入
 
 已有压缩包可直接用于训练数据加载。若要从原始 GRID 视频重新生成，按 `data/GRID/<speaker>/<stem>.mpg` 放置视频，并将 `GRID_V_WER4.8` 教师权重 `model.pth` 放到 `model.json` 同级。数据准备曾使用 Python 3.10、PyTorch 2.8、TorchVision 0.23、TorchAudio 2.8、PyAV 17.1 和 MediaPipe 0.10.14。重新裁剪时沿用 Teacher 的 `torchvision.io.read_video` 读帧路径，避免由于解码差异改变帧序列。

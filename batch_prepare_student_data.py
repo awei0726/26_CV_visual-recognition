@@ -8,9 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torchvision.transforms import functional as TF
 
 from pipelines.data.data_module import AVSRDataLoader
+from student.video import resize_student_roi
 
 
 # 1. 路径与实验划分
@@ -97,10 +97,9 @@ def prepare_sample(speaker, stem, text, output_root, detector, loader):
                 f"灰度 ROI 形状为 {tuple(roi.shape)}，类型为 {roi.dtype}，"
                 f"Teacher 时间步数为 {length}"
             )
-        roi = TF.center_crop(roi, [88, 88])
-        roi = TF.resize(roi.unsqueeze(1), list(ROI_SIZE), antialias=True)
+        roi = resize_student_roi(roi)
         with atomic_output(roi_path, "wb") as stream:
-            np.save(stream, roi.squeeze(1).numpy(), allow_pickle=False)
+            np.save(stream, roi, allow_pickle=False)
 
     record = {
         "id": f"{speaker}/{stem}",

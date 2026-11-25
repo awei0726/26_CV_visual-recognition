@@ -17,6 +17,17 @@ NORMALIZATION_STD = 0.165
 PREPROCESSING_VERSION = "grid_gray64_div255_mean0.421_std0.165_v1"
 
 
+def normalize_roi(roi: np.ndarray, *, expected_length: int | None = None) -> torch.Tensor:
+    """Normalize uint8 [T,64,64] mouth frames exactly as in Student training."""
+    if (not isinstance(roi, np.ndarray) or roi.dtype != np.uint8 or roi.ndim != 3
+            or roi.shape[1:] != INPUT_SIZE or not len(roi)
+            or (expected_length is not None and len(roi) != expected_length)):
+        frames = expected_length if expected_length is not None else "T > 0"
+        raise ValueError(f"expected uint8 ROI [{frames}, {INPUT_SIZE[0]}, {INPUT_SIZE[1]}]")
+    return (torch.from_numpy(np.ascontiguousarray(roi)).unsqueeze(1).float()
+            .div_(255.0).sub_(NORMALIZATION_MEAN).div_(NORMALIZATION_STD))
+
+
 class CharacterVocabulary:
     """Use the teacher's token ordering without adding CTC target symbols."""
 
@@ -153,13 +164,15 @@ class GridDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def fingerprint(self, include_teacher: bool | None = None) -> str:
+    def fingerprint(self, include_teacher: bool | None = None,
+                    indices: Sequence[int] | None = None) -> str:
         """Hash ordered labels and actual input bytes, independent of root location.
 
         Recompute on each call: replacing a cache while leaving its manifest
         untouched must invalidate resume. A baseline hashes only its ROI files;
         KD additionally hashes teacher files. The preprocessing contract and
         exact vocabulary ordering are included to detect changed input semantics.
+        With indices, hash only the selected records in the supplied order.
         """
         include_teacher = self.load_teacher if include_teacher is None else include_teacher
         if not isinstance(include_teacher, bool):
@@ -175,7 +188,8 @@ class GridDataset(Dataset):
                 "preprocessing": PREPROCESSING_VERSION, "input_size": INPUT_SIZE,
                 "mean": NORMALIZATION_MEAN, "std": NORMALIZATION_STD,
                 "teacher_included": include_teacher})
-        for record in self.records:
+        records = self.records if indices is None else (self.records[index] for index in indices)
+        for record in records:
             value = {key: record[key] for key in ("id", "text", "length")}
             for field in ["roi"] + (["teacher"] if include_teacher else []):
                 if field not in record:
@@ -190,9 +204,10 @@ class GridDataset(Dataset):
         length = record["length"]
         roi_path = self.resolve(record["roi"])
         roi = np.load(roi_path, allow_pickle=False)
-        if not isinstance(roi, np.ndarray) or roi.dtype != np.uint8 or roi.shape != (length, *INPUT_SIZE):
-            raise ValueError(f"{record['id']}: expected uint8 ROI {(length, *INPUT_SIZE)}, got {type(roi).__name__}")
-        frames = torch.from_numpy(roi).unsqueeze(1).float().div_(255.0).sub_(NORMALIZATION_MEAN).div_(NORMALIZATION_STD)
+        try:
+            frames = normalize_roi(roi, expected_length=length)
+        except ValueError as error:
+            raise ValueError(f"{record['id']}: {error}") from error
         item = {
             "frames": frames,
             "targets": torch.tensor(self._targets[index], dtype=torch.long),

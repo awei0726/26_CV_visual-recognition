@@ -41,6 +41,7 @@ GRID_TEACHER_VOCAB = Path("benchmarks/GRID/models/GRID_V_WER4.8/model.json")
 MIDTERM_IMPLEMENTATION_SHA256 = "2f46c006fc6b99538ab299da576520929422a0fb44464059e2343396c018cc37"
 # These adaptive releases used the same training math and data conventions.
 COMPATIBLE_ADAPTIVE_IMPLEMENTATIONS = {
+    "38986a48c7b168be28c5604f18b156da0326fcb23a2c5c5487c51bac406c152e",  # Before the within-speaker protocol option
     "8cf5485372ea9dcc7b30cf68c55929544ccddabc64977b7e7a9b68d323716c3c",  # aa50ac0, 6545be1
     "d7b68743f417fdd4fc951ea42d95c0e78ab995f6a500fd507cb8ebe2fe9409a5",  # 4e26079
     "44df44fb01b92ba34f3212ac1958fb56be0f0dcc203215a5bdd98ace36fef9f6",  # 4a85cef
@@ -203,8 +204,10 @@ def parse_args(argv=None):
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--mode", choices=("ctc", "kd", *ADAPTIVE_MODES), default="ctc",
                         help="CTC only, standard KD, entropy-aware KD, or entropy+blank-aware KD")
-    parser.add_argument("--train-manifest", type=Path, default=Path("data/student_grid/train.jsonl"))
-    parser.add_argument("--val-manifest", type=Path, default=Path("data/student_grid/val.jsonl"))
+    parser.add_argument("--split-protocol", choices=("speaker-independent", "within-speaker"),
+                        default="speaker-independent")
+    parser.add_argument("--train-manifest", type=Path)
+    parser.add_argument("--val-manifest", type=Path)
     parser.add_argument("--vocab", type=Path, default=GRID_TEACHER_VOCAB)
     parser.add_argument("--model-config", type=Path, help="JSON object of StudentModel constructor options")
     parser.add_argument("--output-dir", type=Path, help="Run output directory, required for training")
@@ -243,6 +246,11 @@ def parse_args(argv=None):
                         help="Subset selection seed for --train-size (default: 42)")
     parser.add_argument("--limit-val", type=int, help="First N validation samples, for pipeline checks only")
     args = parser.parse_args(argv)
+    manifest_dir = GRID_MANIFEST_DIR
+    if args.split_protocol == "within-speaker":
+        manifest_dir = manifest_dir / "within_speaker"
+    args.train_manifest = args.train_manifest or manifest_dir / "train.jsonl"
+    args.val_manifest = args.val_manifest or manifest_dir / "val.jsonl"
     if args.output_dir is None and not args.preflight_only:
         parser.error("the following arguments are required: --output-dir")
     if args.preflight_only and args.resume is not None:
@@ -347,15 +355,22 @@ def run(args, root, output):
         raise ValueError("Training and validation sample IDs overlap")
     train_speakers = {key.split("/")[0] for key in train_ids}
     val_speakers = {key.split("/")[0] for key in val_ids}
-    if train_speakers & val_speakers:
+    within_speaker = args.split_protocol == "within-speaker"
+    if not within_speaker and train_speakers & val_speakers:
         raise ValueError("Speaker-independent training requires disjoint train/validation speakers")
     train_files = {train_set.resolve(record["roi"]).resolve() for record in train_set.records}
     val_files = {val_set.resolve(record["roi"]).resolve() for record in val_set.records}
     if train_files & val_files:
         raise ValueError("Training and validation refer to the same ROI files")
-    if args.mode in ADAPTIVE_MODES or args.preflight_only or args.reference_config:
-        with (ROOT / GRID_MANIFEST_DIR / "test.jsonl").open(encoding="utf-8-sig") as stream:
+    if within_speaker or args.mode in ADAPTIVE_MODES or args.preflight_only or args.reference_config:
+        test_path = (root / GRID_MANIFEST_DIR / "within_speaker" / "test.jsonl" if within_speaker
+                     else ROOT / GRID_MANIFEST_DIR / "test.jsonl")
+        with test_path.open(encoding="utf-8-sig") as stream:
             test_rows = [json.loads(line) for line in stream if line.strip()]
+        if within_speaker:
+            test_speakers = {row["id"].split("/", 1)[0] for row in test_rows}
+            if not train_speakers == val_speakers == test_speakers:
+                raise ValueError("Within-speaker splits must contain the same speakers")
         input_ids, input_files = train_ids | val_ids, train_files | val_files
         overlap = [row["id"] for row in test_rows
                    if row["id"] in input_ids or train_set.resolve(row["roi"]).resolve() in input_files]

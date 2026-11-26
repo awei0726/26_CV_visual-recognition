@@ -1,5 +1,7 @@
 # GRID Student 训练准备
 
+[同说话人 70/10/20 划分](data/student_grid/within_speaker/README.md)
+
 本项目已生成 Student 的灰度嘴部序列和 Teacher 的逐时间步 CTC logits。三份实验清单按说话人划分，共有 13,887 条已配对样本。
 
 | 划分 | 说话人 | 样本数 | 数据包 |
